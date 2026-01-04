@@ -2,6 +2,9 @@ import math
 
 import torch
 
+from vllm.forward_context import ForwardContext
+
+
 DEFAULT_BLOCK_SIZE = 128
 MIN_TOPK_LEN = 32
 MAX_TOPK_LEN = 48
@@ -62,3 +65,14 @@ def align_to_256bytes(extent: int, dtype: torch.dtype) -> int:
     dtype_szie = get_type_size(dtype)
     eles_per_256bytes = 256 // dtype_szie
     return round_up(extent, eles_per_256bytes)
+
+
+def get_kv_cache(forward_context: ForwardContext, layer_name: str) -> torch.Tensor:
+    layer = forward_context.no_compile_layers[layer_name]
+    kv_cache = layer.kv_cache[forward_context.virtual_engine]
+    return kv_cache
+
+
+def get_layer_id(layer_name: str) -> int:
+    layer_id = int(layer_name.split(".")[2])
+    return layer_id
