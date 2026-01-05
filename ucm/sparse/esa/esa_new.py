@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-import torch.cuda.nvtx as nvtx
 
 from vllm.config import VllmConfig
 from vllm.forward_context import ForwardContext
@@ -22,7 +21,7 @@ from ucm.sparse.base import (
     UcmSparseBlockManager,
     UcmSparseCpuGpuBuffer
 )
-from ucm.sparse.utils import get_kv_cache, get_layer_id
+from ucm.sparse.utils import get_kv_cache, get_layer_id, nvtx_range
 
 import ucm.sparse.esa.esa_interface as esa_lib
 esa_retrieval = esa_lib.esa_retrieval
@@ -146,7 +145,7 @@ class ESA(UcmSparseBase):
                           requests: dict[str, CachedRequestState],
                           input_batch: InputBatch,
                           attn_metadata: Any) -> UcmSparseMetadata:
-        with nvtx.range(f"esa_build_sparse_meta"):
+        with nvtx_range("esa_build_sparse_meta"):
             if isinstance(attn_metadata, dict):
                 attn_metadata = next(iter(attn_metadata.values()))
 
@@ -227,7 +226,7 @@ class ESA(UcmSparseBase):
         if self.sparse_metadata.decode is None:
             return
 
-        with nvtx.range(f"esa_attention_begin"):
+        with nvtx_range("esa_attention_begin"):
             layer_id = get_layer_id(layer_name)
             self.retrieval_input.query = query
             self.retrieval_input.repre_cache = self.device_repre_cache[layer_id]
@@ -250,7 +249,7 @@ class ESA(UcmSparseBase):
         if self.sparse_metadata.prefill is None:
             return
 
-        with nvtx.range(f"esa_attention_finished"):
+        with nvtx_range("esa_attention_finished"):
             layer_id = get_layer_id(layer_name)
             k_cache, _ = get_kv_cache(forward_context, layer_name)
             esa_repre(k_cache.flatten(-2, -1),
