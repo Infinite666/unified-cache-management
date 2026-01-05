@@ -4,6 +4,7 @@
 # TODO: interface of esa_retrieval
 
 import math
+from itertools import chain
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -15,6 +16,7 @@ from vllm.forward_context import ForwardContext
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from ucm.utils import Config
 from ucm.sparse.base import (
     UcmSparseBase,
     UcmSparseMetadata,
@@ -46,7 +48,9 @@ class EsaDecodeMetadata:
     repre_blocks: UcmSparseCpuGpuBuffer  # repre block ids
     req_indexes: torch.Tensor  # req indexes
     batch_offset: torch.Tensor  # num repre blocks offset
+    fixed_block_indexes: torch.Tensor  # fixed block indexes in repre_blocks (with maximum score)
     num_blocks: int = 0  # num of repre blocks
+    num_fixed_blocks: int = 0  # num of fixed blocks (with maximum score)
 
 
 @dataclass
@@ -84,6 +88,9 @@ class ESA(UcmSparseBase):
         super().__init__(vllm_config, role)
 
         model_config = vllm_config.model_config
+        max_block_per_seq = math.ceil(model_config.max_model_len / vllm_config.cache_config.block_size)
+        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self.max_num_blocks =  max_block_per_seq * self.max_num_seqs
         self.num_kv_heads =  model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.head_size = model_config.get_head_size()
         self.num_layers = model_config.hf_config.num_hidden_layers
@@ -92,9 +99,12 @@ class ESA(UcmSparseBase):
         self.dtype = model_config.dtype
         self.pin_memory = True
 
-        max_block_per_seq = math.ceil(model_config.max_model_len / vllm_config.cache_config.block_size)
-        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self.max_num_blocks =  max_block_per_seq * self.max_num_seqs
+        self.esa_cfg = Config(vllm_config.kv_transfer_config).get_config().get("ucm_sparse_config").get("ESA")
+        self.min_blocks = self.esa_cfg.get("min_blocks", 4)
+        self.init_window = self.esa_cfg.get("init_window_sz", 1)
+        self.local_window = self.esa_cfg.get("local_window_sz", 2)
+        self.fixed_window = self.init_window + self.local_window
+        assert self.min_blocks > self.fixed_window, "ESA min_blocks should be larger than init_window_sz + local_window_sz."
 
         ########################
         # kv and repre cache
@@ -128,6 +138,7 @@ class ESA(UcmSparseBase):
         self.decode_kv_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
         self.decode_repre_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
         self.decode_req_indexes = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
+        self.decode_fixed_indexes = self._make_buffer(self.fixed_window * self.max_num_seqs, dtype=torch.int32)
         self.decode_batch_offset = torch.zeros(self.max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
         ########################
 
@@ -150,15 +161,19 @@ class ESA(UcmSparseBase):
             if isinstance(attn_metadata, dict):
                 attn_metadata = next(iter(attn_metadata.values()))
 
+            num_prefills = 0
+            num_decodes = 0
             num_prefill_kv_blocks = 0
             num_decode_kv_blocks = 0
             num_decode_sparse_blocks = 0
-            num_prefills = 0
-            num_decodes = 0
+            num_decode_fixed_blocks = 0
             for (req_id, num_scheduled_tokens) in scheduler_output.num_scheduled_tokens.items():
                 req = requests[req_id]
-                is_decode = num_scheduled_tokens <= 1
                 num_blocks = math.ceil(req.num_prompt_tokens / self.block_size)
+                if num_blocks <= self.min_blocks:
+                    continue
+
+                is_decode = num_scheduled_tokens <= 1
                 block_tables = req.block_ids[0]
 
                 # construct metadata for prefill batch
@@ -176,13 +191,18 @@ class ESA(UcmSparseBase):
                 if is_decode:
                     sparse_blocks = self.block_manager.get_blocks(req_id)
                     num_sparse_blocks = len(sparse_blocks)
-                    assert sparse_blocks is not None, f"req {req_id} does not has sparse blocks"
+                    assert sparse_blocks is not None, f"req {req_id} does not has sparse blocks."
 
+                    fixed_indexes = list(chain(range(num_decode_sparse_blocks + self.init_window),
+                                               range(num_decode_sparse_blocks + num_sparse_blocks - self.local_window,
+                                                     num_decode_sparse_blocks + num_sparse_blocks)))
                     self.decode_kv_blocks.np[num_decode_kv_blocks:num_decode_kv_blocks + num_blocks] = block_tables[:num_blocks]
                     self.decode_repre_blocks.np[num_decode_sparse_blocks:num_decode_sparse_blocks + num_sparse_blocks] = sparse_blocks
+                    self.decode_fixed_indexes.np[num_decode_fixed_blocks:num_decode_fixed_blocks + self.fixed_window] = fixed_indexes
                     self.decode_req_indexes.np[num_decodes] = input_batch.req_id_to_index[req_id]
                     num_decode_kv_blocks += num_blocks
                     num_decode_sparse_blocks += num_sparse_blocks
+                    num_decode_fixed_blocks += self.fixed_window
                     num_decodes += 1
                     self.decode_batch_offset[num_decodes] = num_decode_sparse_blocks
 
@@ -201,12 +221,15 @@ class ESA(UcmSparseBase):
                 self.decode_kv_blocks.copy_to_gpu(num_decode_kv_blocks)
                 self.decode_repre_blocks.copy_to_gpu(num_decode_sparse_blocks)
                 self.decode_req_indexes.copy_to_gpu(num_decodes)
+                self.decode_fixed_indexes.copy_to_gpu(num_decode_fixed_blocks)
                 decode_metadata = EsaDecodeMetadata(
                     kv_blocks=self.decode_kv_blocks.gpu,
                     repre_blocks=self.decode_repre_blocks,
                     req_indexes=self.decode_req_indexes.gpu,
                     batch_offset=self.decode_batch_offset,
+                    fixed_block_indexes=self.decode_fixed_indexes.gpu,
                     num_blocks=num_decode_sparse_blocks,
+                    num_fixed_blocks=num_decode_fixed_blocks,
                 )
 
             self.sparse_metadata = EsaMetadata(
