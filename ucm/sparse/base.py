@@ -37,6 +37,10 @@ if TYPE_CHECKING:
 import torch
 import numpy as np
 
+from ucm.logger import init_logger
+
+
+logger = init_logger(__name__)
 
 INVALID_SLOT = -1
 
@@ -51,8 +55,14 @@ class UcmSparseRole(enum.Enum):
 
 class UcmSparseMetadata(ABC):  # noqa: B024
     """
-    Abstract Metadata used to communicate between the
-    Scheduler UcmSparse instance and Worker UcmSparse instance.
+    Abstract Metadata used to hold the necessary metadata for sparse.
+    """
+    pass
+
+
+class UcmSparseCachedRequestData(ABC):
+    """
+    Abstract Metadata used to cache necessary data of requests.
     """
     pass
 
@@ -65,7 +75,10 @@ class UcmSparseBlockManager:
         self.free_blocks = list(range(capability - 1, -1, -1))
 
     def allocate(self, num_blocks: int) -> List[int]:
-        assert len(self.free_blocks) >= num_blocks, f"No free blocks left, the capability is {self.capability}"
+        if len(self.free_blocks) < num_blocks:
+            logger.warning(f"No enough free sparse blocks for {num_blocks}")
+            return None
+
         res = []
         for _ in range(num_blocks):
             res.append(self.free_blocks.pop())
@@ -93,6 +106,7 @@ class UcmSparseCpuGpuBuffer:
                                pin_memory=pin_memory)
         self.gpu = self.cpu.to(device)
         self.np: np.ndarray
+        self.n = 0
 
         if with_numpy:
             if dtype == torch.bfloat16:
@@ -101,20 +115,49 @@ class UcmSparseCpuGpuBuffer:
                     "numpy array, so call UcmSparseCpuGpuBuffer with with_numpy=False")
             self.np = self.cpu.numpy()
 
-    def copy_to_gpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_gpu(self, n: Optional[int] = None) -> None:
         # TODO: replace with esa_copy
         if n is None:
-            return self.gpu.copy_(self.cpu, non_blocking=True)
-        return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
+            n = self.n
+        if n <= 0:
+            return
+        self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
 
-    def copy_to_cpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_cpu(self, n: Optional[int] = None) -> None:
         # TODO: replace with esa_copy
         """NOTE: Because this method is non-blocking, explicit synchronization
         is needed to ensure the data is copied to CPU."""
         if n is None:
-            return self.cpu.copy_(self.gpu, non_blocking=True)
-        return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
+            n = self.n
+        if n <= 0:
+            return
+        self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
 
+    def append_numpy(self, data: List[Any]) -> None:
+        size = len(data)
+        assert self.np is not None, "append_numpy meed to be initialized by with_numpy=True."
+        assert self.n + size < self.cpu.shape[0], "append_numpy data out of range."
+        self.np[self.n:self.n + size] = data
+        self.n += size
+
+    def clear(self) -> None:
+        self.n = 0
+
+    @property
+    def size(self) -> int:
+        return self.n
+
+    @property
+    def valid_np(self) -> np.ndarray:
+        return self.np[:self.n]
+
+    @property
+    def valid_cpu(self) -> torch.Tensor:
+        return self.cpu[:self.n]
+
+    @property
+    def valid_gpu(self) -> torch.Tensor:
+        return self.gpu[:self.n]
 
 class UcmSparseBase(ABC):
     """
@@ -122,13 +165,10 @@ class UcmSparseBase(ABC):
     """
 
     def __init__(self, vllm_config: VllmConfig, role: UcmSparseRole) -> None:
+        self.cached_reqs: dict[str, UcmSparseCachedRequestData] = dict()
         self.sparse_metadata: Optional[UcmSparseMetadata] = None
-        self._vllm_config = vllm_config
-        self._role = role
-
-    @property
-    def role(self) -> UcmSparseRole:
-        return self._role
+        self.vllm_config = vllm_config
+        self.role = role
 
     # ==============================
     # Worker-side methods
