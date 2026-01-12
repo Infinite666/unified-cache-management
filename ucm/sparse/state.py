@@ -54,7 +54,7 @@ def ensure_ucm_sparse_initialized(
         # Update role if needed (for debugging/logging purposes)
         logger.debug(
             "UCM sparse agent already initialized, current role: %s",
-            _UCM_SPARSE_AGENT._role,
+            _UCM_SPARSE_AGENT.role,
         )
 
 

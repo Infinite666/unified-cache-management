@@ -5,8 +5,8 @@
 
 import math
 from itertools import chain
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Union
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -20,11 +20,12 @@ from ucm.utils import Config
 from ucm.sparse.base import (
     UcmSparseBase,
     UcmSparseMetadata,
+    UcmSparseCachedRequestData,
     UcmSparseRole,
     UcmSparseBlockManager,
     UcmSparseCpuGpuBuffer
 )
-from ucm.sparse.utils import get_kv_cache, get_layer_id
+from ucm.sparse.utils import cdiv, get_kv_cache, get_layer_id
 
 import ucm.sparse.esa.esa_interface as esa_lib
 esa_retrieval = esa_lib.esa_retrieval
@@ -38,7 +39,6 @@ class EsaPrefillMetadata:
     """Metadata of current prefill batch."""
     kv_blocks: torch.Tensor  # kv block ids
     repre_blocks: torch.Tensor  # repre block ids
-    num_blocks: int = 0  # num of kv blocks
 
 
 @dataclass
@@ -46,10 +46,13 @@ class EsaDecodeMetadata:
     """Metadata of current decode batch."""
     kv_blocks: torch.Tensor  # kv block ids
     repre_blocks: UcmSparseCpuGpuBuffer  # repre block ids
+    leftover_kv_blocks: torch.Tensor  # leftover kv block ids
+    leftover_repre_blocks: torch.Tensor  # leftover repre block ids
     req_indexes: torch.Tensor  # req indexes
     batch_offset: torch.Tensor  # num repre blocks offset
     fixed_block_indexes: torch.Tensor  # fixed block indexes in repre_blocks (with maximum score)
     num_blocks: int = 0  # num of repre blocks
+    num_leftover_blocks: int = 0  # num of leftover blocks
     num_fixed_blocks: int = 0  # num of fixed blocks (with maximum score)
 
 
@@ -62,25 +65,13 @@ class EsaMetadata(UcmSparseMetadata):
     decode: Optional[EsaDecodeMetadata] = None
 
 
-class EsaBlockManager(UcmSparseBlockManager):
-    """Manages the allocation of ESA device_repre/host_kv blocks."""
-
-    def __init__(self, capability: int) -> None:
-        super().__init__(capability)
-        self.req_id_to_blocks: Dict[str, List[int]] = {}
-
-    def allocate(self, num_blocks: int, req_id: str) -> List[int]:
-        blocks = super().allocate(num_blocks)
-        self.req_id_to_blocks[req_id] = blocks
-        return blocks
-
-    def free(self, blocks: List[int], req_id: str) -> None:
-        assert req_id in self.req_id_to_blocks
-        super().free(blocks)
-        del self.req_id_to_blocks[req_id]
-
-    def get_blocks(self, req_id: str) -> List[int]:
-        return self.req_id_to_blocks.get(req_id, None)
+@dataclass
+class EsaCachedRequestData(UcmSparseCachedRequestData):
+    """Metadata of cached request."""
+    sparse_blocks: List[int] = field(default_factory=list)  # block ids of device_repre/host_kv 
+    num_prompt_blocks: int = 0  # num of prompt blocks when prefill
+    num_compressed_prompt_blocks: int = 0  # num of prompt blocks when decode (after compression)
+    step: int = 0  # the step of request
 
 
 class ESA(UcmSparseBase):
@@ -99,14 +90,22 @@ class ESA(UcmSparseBase):
         self.dtype = model_config.dtype
         self.pin_memory = True
 
-        self.esa_cfg = Config(vllm_config.kv_transfer_config).get_config().get("ucm_sparse_config").get("ESA")
+        self._init_sparse_cfg()
+        self._init_cache()
+
+    def _init_sparse_cfg(self):
+        self.esa_cfg = Config(self.vllm_config.kv_transfer_config).get_config().get("ucm_sparse_config").get("ESA")
         self.min_blocks = self.esa_cfg.get("min_blocks", 4)
+        self.sparse_ratio = self.esa_cfg.get("sparse_ratio", 0.2)
         self.init_window = self.esa_cfg.get("init_window_sz", 1)
         self.local_window = self.esa_cfg.get("local_window_sz", 2)
         self.fixed_window = self.init_window + self.local_window
         assert self.min_blocks > self.fixed_window, "ESA min_blocks should be larger than init_window_sz + local_window_sz."
 
-        ########################
+    def _init_cache(self):
+        if self.role != UcmSparseRole.WORKER:
+            return
+
         # kv and repre cache
         host_kv_shape = (1000, self.block_size, self.num_kv_heads, self.head_size) # TODO:从config里拿到实际的blocks数量*3
         self.host_kv_cache = [
@@ -118,10 +117,8 @@ class ESA(UcmSparseBase):
             torch.zeros(repre_shape, dtype=self.dtype, device=self.device)
             for _ in range(self.num_layers)
         ]
-        self.block_manager = EsaBlockManager(self.max_num_blocks)
-        ########################
+        self.block_manager = UcmSparseBlockManager(self.max_num_blocks)
 
-        ########################
         # retrieval input and output
         self.retrieval_input = esa_lib.RetrievalInputTensor()
         self.retrieval_output = esa_lib.RetrievalOutputTensor()
@@ -129,18 +126,17 @@ class ESA(UcmSparseBase):
         self.retrieval_output.score_cpu = torch.zeros(self.max_num_blocks, dtype=self.dtype, device="cpu", pin_memory=self.pin_memory)
         self.retrieval_output.score_sorted_cpu = torch.zeros(self.max_num_blocks, dtype=self.dtype, device="cpu", pin_memory=self.pin_memory)
         self.retrieval_output.index_sorted_cpu = torch.zeros(self.max_num_blocks, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
-        ########################
 
-        ########################
         # batch dynamic metadata
         self.prefill_kv_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
         self.prefill_repre_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
         self.decode_kv_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
         self.decode_repre_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
+        self.decode_leftover_kv_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
+        self.decode_leftover_repre_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
         self.decode_req_indexes = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
         self.decode_fixed_indexes = self._make_buffer(self.fixed_window * self.max_num_seqs, dtype=torch.int32)
         self.decode_batch_offset = torch.zeros(self.max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
-        ########################
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -151,6 +147,19 @@ class ESA(UcmSparseBase):
                                      device=self.device,
                                      pin_memory=self.pin_memory,
                                      with_numpy=numpy)
+
+    def _clear_buffer(self) -> None:
+        self.prefill_kv_blocks.clear()
+        self.prefill_repre_blocks.clear()
+        self.decode_kv_blocks.clear()
+        self.decode_repre_blocks.clear()
+        self.decode_leftover_kv_blocks.clear()
+        self.decode_leftover_repre_blocks.clear()
+        self.decode_req_indexes.clear()
+        self.decode_fixed_indexes.clear()
+
+    def _get_num_compressed_prompt_blocks(self, num_prompt_blocks: int) -> int:
+        return self.fixed_window + int((num_prompt_blocks - self.fixed_window) * self.sparse_ratio)
 
     def build_sparse_meta(self,
                           scheduler_output: SchedulerOutput,
@@ -163,73 +172,91 @@ class ESA(UcmSparseBase):
 
             num_prefills = 0
             num_decodes = 0
-            num_prefill_kv_blocks = 0
-            num_decode_kv_blocks = 0
             num_decode_sparse_blocks = 0
-            num_decode_fixed_blocks = 0
+            self._clear_buffer()
             for (req_id, num_scheduled_tokens) in scheduler_output.num_scheduled_tokens.items():
                 req = requests[req_id]
-                num_blocks = math.ceil(req.num_prompt_tokens / self.block_size)
-                if num_blocks <= self.min_blocks:
-                    continue
-
-                is_decode = num_scheduled_tokens <= 1
+                is_decode = req_id in self.cached_reqs
+                if is_decode:
+                    num_prompt_blocks = self.cached_reqs[req_id].num_prompt_blocks
+                else:
+                    num_prompt_blocks = cdiv(req.num_prompt_tokens, self.block_size)
+                    if num_prompt_blocks <= self.min_blocks:
+                        continue
                 block_tables = req.block_ids[0]
+                num_blocks = len(block_tables)
 
                 # construct metadata for prefill batch
                 is_last_chunk = (not is_decode) and (req.num_computed_tokens + num_scheduled_tokens >= req.num_prompt_tokens)
                 if is_last_chunk:
-                    assert num_blocks == len(block_tables)
                     # sparse_blocks will be used as indexes for both device_repre_cache and host_kv_cache
-                    sparse_blocks = self.block_manager.allocate(num_blocks, req_id=req_id)
-                    self.prefill_kv_blocks.np[num_prefill_kv_blocks:num_prefill_kv_blocks + num_blocks] = block_tables
-                    self.prefill_repre_blocks.np[num_prefill_kv_blocks:num_prefill_kv_blocks + num_blocks] = sparse_blocks
-                    num_prefill_kv_blocks += num_blocks
+                    sparse_blocks = self.block_manager.allocate(num_blocks)
+                    if sparse_blocks is None:
+                        continue
+
+                    self.cached_reqs[req_id] = EsaCachedRequestData(sparse_blocks=sparse_blocks,
+                                                                    num_prompt_blocks=num_prompt_blocks)
+                    self.prefill_kv_blocks.append_numpy(block_tables)
+                    self.prefill_repre_blocks.append_numpy(sparse_blocks)
                     num_prefills += 1
 
                 # construct metadata for decode batch
                 if is_decode:
-                    sparse_blocks = self.block_manager.get_blocks(req_id)
+                    if req_id not in self.cached_reqs:
+                        continue
+
+                    sparse_blocks = self.cached_reqs[req_id].sparse_blocks
                     num_sparse_blocks = len(sparse_blocks)
-                    assert sparse_blocks is not None, f"req {req_id} does not has sparse blocks."
+                    assert num_sparse_blocks > 0, f"req {req_id} does not has sparse blocks."
+
+                    is_first_decode = self.cached_reqs[req_id].step == 0
+                    if is_first_decode:
+                        num_compressed_prompt_blocks = self._get_num_compressed_prompt_blocks(num_prompt_blocks)
+                        self.cached_reqs[req_id].num_compressed_prompt_blocks = num_compressed_prompt_blocks
+                        num_leftover_blocks = num_blocks - num_compressed_prompt_blocks + 1
+                        self.decode_leftover_kv_blocks.append_numpy(block_tables[-num_leftover_blocks:])
+                        self.decode_leftover_repre_blocks.append_numpy(sparse_blocks[-num_leftover_blocks:])
+                    else:
+                        num_compressed_prompt_blocks = self.cached_reqs[req_id].num_compressed_prompt_blocks
+                    self.cached_reqs[req_id].step += 1
 
                     fixed_indexes = list(chain(range(num_decode_sparse_blocks + self.init_window),
                                                range(num_decode_sparse_blocks + num_sparse_blocks - self.local_window,
-                                                     num_decode_sparse_blocks + num_sparse_blocks)))
-                    self.decode_kv_blocks.np[num_decode_kv_blocks:num_decode_kv_blocks + num_blocks] = block_tables[:num_blocks]
-                    self.decode_repre_blocks.np[num_decode_sparse_blocks:num_decode_sparse_blocks + num_sparse_blocks] = sparse_blocks
-                    self.decode_fixed_indexes.np[num_decode_fixed_blocks:num_decode_fixed_blocks + self.fixed_window] = fixed_indexes
-                    self.decode_req_indexes.np[num_decodes] = input_batch.req_id_to_index[req_id]
-                    num_decode_kv_blocks += num_blocks
-                    num_decode_sparse_blocks += num_sparse_blocks
-                    num_decode_fixed_blocks += self.fixed_window
+                                                     num_decode_sparse_blocks + num_sparse_blocks - 1)))
+                    self.decode_kv_blocks.append_numpy(block_tables[:num_compressed_prompt_blocks - 1])
+                    self.decode_repre_blocks.append_numpy(sparse_blocks[:num_prompt_blocks - 1])
+                    self.decode_fixed_indexes.append_numpy(fixed_indexes)
+                    self.decode_req_indexes.append_numpy([input_batch.req_id_to_index[req_id]])
+                    num_decode_sparse_blocks += num_prompt_blocks - 1
                     num_decodes += 1
                     self.decode_batch_offset[num_decodes] = num_decode_sparse_blocks
 
             prefill_metadata = None
             decode_metadata = None
             if num_prefills > 0:
-                self.prefill_kv_blocks.copy_to_gpu(num_prefill_kv_blocks)
-                self.prefill_repre_blocks.copy_to_gpu(num_prefill_kv_blocks)
+                self.prefill_kv_blocks.copy_to_gpu()
+                self.prefill_repre_blocks.copy_to_gpu()
                 prefill_metadata = EsaPrefillMetadata(
-                    kv_blocks=self.prefill_kv_blocks.gpu,
-                    repre_blocks=self.prefill_repre_blocks.gpu,
-                    num_blocks=num_prefill_kv_blocks,
+                    kv_blocks=self.prefill_kv_blocks.valid_gpu,
+                    repre_blocks=self.prefill_repre_blocks.valid_gpu,
                 )
 
             if num_decodes > 0:
-                self.decode_kv_blocks.copy_to_gpu(num_decode_kv_blocks)
-                self.decode_repre_blocks.copy_to_gpu(num_decode_sparse_blocks)
-                self.decode_req_indexes.copy_to_gpu(num_decodes)
-                self.decode_fixed_indexes.copy_to_gpu(num_decode_fixed_blocks)
+                self.decode_kv_blocks.copy_to_gpu()
+                self.decode_repre_blocks.copy_to_gpu()
+                self.decode_req_indexes.copy_to_gpu()
+                self.decode_fixed_indexes.copy_to_gpu()
                 decode_metadata = EsaDecodeMetadata(
                     kv_blocks=self.decode_kv_blocks.gpu,
                     repre_blocks=self.decode_repre_blocks,
+                    leftover_kv_blocks=self.decode_kv_blocks.gpu,
+                    leftover_repre_blocks=self.decode_repre_blocks.gpu,
                     req_indexes=self.decode_req_indexes.gpu,
                     batch_offset=self.decode_batch_offset,
                     fixed_block_indexes=self.decode_fixed_indexes.gpu,
                     num_blocks=num_decode_sparse_blocks,
-                    num_fixed_blocks=num_decode_fixed_blocks,
+                    num_leftover_blocks=self.decode_leftover_kv_blocks.size,
+                    num_fixed_blocks=self.decode_fixed_indexes.size,
                 )
 
             self.sparse_metadata = EsaMetadata(
@@ -278,9 +305,9 @@ class ESA(UcmSparseBase):
             k_cache, _ = get_kv_cache(forward_context, layer_name)
             esa_repre(k_cache.flatten(-2, -1),
                       self.device_repre_cache[layer_id].flatten(-2, -1),
-                      self.sparse_metadata.prefill.kv_blocks[:self.sparse_metadata.prefill.num_blocks],
-                      self.sparse_metadata.prefill.repre_blocks[:self.sparse_metadata.prefill.num_blocks])
+                      self.sparse_metadata.prefill.kv_blocks,
+                      self.sparse_metadata.prefill.repre_blocks)
             esa_scatter_copy(k_cache.flatten(-3),
                              self.host_kv_cache[layer_id].flatten(-3),
-                             self.sparse_metadata.prefill.kv_blocks[:self.sparse_metadata.prefill.num_blocks],
-                             self.sparse_metadata.prefill.repre_blocks[:self.sparse_metadata.prefill.num_blocks])
+                             self.sparse_metadata.prefill.kv_blocks,
+                             self.sparse_metadata.prefill.repre_blocks)
