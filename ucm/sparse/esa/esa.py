@@ -12,9 +12,9 @@ from numpy.typing import NDArray
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.forward_context import ForwardContext
-from vllm.sequence import SequenceStage
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.core.sched.output import SchedulerOutput
 
 from ucm.integration.vllm.ucm_connector import RequestHasher
 from ucm.sparse.base import (
@@ -760,12 +760,13 @@ class ESA(UcmSparseBase):
     def request_begin(self, request_id: ReqType, prompt_token_ids: List[int]):
         pass
 
-    def request_finished_in_worker(self, request_id: ReqType):
-        if request_id not in self.req_states:
-            return
-        for layer_state in self.req_states[request_id]:
-            layer_state.repre_pool.free(layer_state.slots)
-        del self.req_states[request_id]
+    def update_states(self, scheduler_output: SchedulerOutput) -> None:
+        for request_id in scheduler_output.finished_req_ids:
+            if request_id not in self.req_states:
+                continue
+            for layer_state in self.req_states[request_id]:
+                layer_state.repre_pool.free(layer_state.slots)
+            del self.req_states[request_id]
 
     def request_finished_in_scheduler(self, request_id: Union[int, str]):
         """

@@ -522,9 +522,9 @@ def _patch_model_runner_v1() -> None:
             The SamplingMetadata is updated and copied to the NPU if there is a
             new/resumed/paused/finished request in the batch.
             """
+            self.ucm_sparse_update_states(scheduler_output)
             # Remove finished requests from the cached states.
             for req_id in scheduler_output.finished_req_ids:
-                self.ucm_sparse_request_finished_in_worker(req_id)
                 self.requests.pop(req_id, None)
                 self.encoder_cache.pop(req_id, None)
             # Remove the finished requests from the persistent batch.
@@ -1357,19 +1357,17 @@ def _patch_model_runner_v1() -> None:
             ucm_sparse = get_ucm_sparse()
             ucm_sparse.execute_finished()
 
-        def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
+        def ucm_sparse_update_states(self, scheduler_output: SchedulerOutput):
             if not has_ucm_sparse():
                 return
             ucm_sparse = get_ucm_sparse()
-            ucm_sparse.request_finished_in_worker(request_id)
+            ucm_sparse.update_states(scheduler_output)
 
         NPUModelRunner.maybe_execute_ucm_sparse_begin = maybe_execute_ucm_sparse_begin
         NPUModelRunner.maybe_execute_ucm_sparse_finished = (
             maybe_execute_ucm_sparse_finished
         )
-        NPUModelRunner.ucm_sparse_request_finished_in_worker = (
-            ucm_sparse_request_finished_in_worker
-        )
+        NPUModelRunner.ucm_sparse_update_states = ucm_sparse_update_states
     except ImportError as e:
         logger.error(f"Failed to patch model_runner_v1.py: {e}", exc_info=True)
         raise

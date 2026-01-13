@@ -9,6 +9,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.forward_context import ForwardContext
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request
+from vllm.v1.core.sched.output import SchedulerOutput
 
 from ucm.integration.vllm.ucm_connector import RequestHasher
 from ucm.sparse.base import (
@@ -721,8 +722,11 @@ class KVStarMultiStep(UcmSparseBase):
     # Worker-side methods
     # ==============================
 
-    def request_finished_in_worker(self, request_id: ReqType):
-        del self.req_states[request_id]
+    def update_states(self, scheduler_output: SchedulerOutput) -> None:
+        for request_id in scheduler_output.finished_req_ids:
+            if request_id not in self.req_states:
+                continue
+            del self.req_states[request_id]
 
     def attention_begin(
         self,

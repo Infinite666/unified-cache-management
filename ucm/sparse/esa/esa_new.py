@@ -1,4 +1,3 @@
-# TODO: handle preemption
 # TODO: init ESA before warmup to make profile_run right!!!
 # TODO: reduce memory usage
 # TODO: interface of esa_retrieval
@@ -311,3 +310,20 @@ class ESA(UcmSparseBase):
                              self.host_kv_cache[layer_id].flatten(-3),
                              self.sparse_metadata.prefill.kv_blocks,
                              self.sparse_metadata.prefill.repre_blocks)
+
+    def _free_cached_request(self, request_id: Union[int, str]) -> None:
+        if request_id not in self.cached_reqs:
+            return
+        print(f"free req={request_id}")
+        self.block_manager.free(self.cached_reqs[request_id].sparse_blocks)
+        del self.cached_reqs[request_id]
+
+    def update_states(self, scheduler_output: SchedulerOutput) -> None:
+        for req_id in scheduler_output.finished_req_ids:
+            self._free_cached_request(req_id)
+
+        req_data = scheduler_output.scheduled_cached_reqs
+        for req_id, resumed_from_preemption in zip(req_data.req_ids,
+                                                   req_data.resumed_from_preemption):
+            if resumed_from_preemption:
+                self._free_cached_request(req_id)

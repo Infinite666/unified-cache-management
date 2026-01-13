@@ -1201,19 +1201,17 @@ def _patch_gpu_model_runner() -> None:
             ucm_sparse = get_ucm_sparse()
             ucm_sparse.execute_finished()
 
-        def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
+        def ucm_sparse_update_states(self, scheduler_output: SchedulerOutput):
             if not has_ucm_sparse():
                 return
             ucm_sparse = get_ucm_sparse()
-            ucm_sparse.request_finished_in_worker(request_id)
+            ucm_sparse.update_states(scheduler_output)
 
         GPUModelRunner.maybe_execute_ucm_sparse_begin = maybe_execute_ucm_sparse_begin
         GPUModelRunner.maybe_execute_ucm_sparse_finished = (
             maybe_execute_ucm_sparse_finished
         )
-        GPUModelRunner.ucm_sparse_request_finished_in_worker = (
-            ucm_sparse_request_finished_in_worker
-        )
+        GPUModelRunner.ucm_sparse_update_states = ucm_sparse_update_states
 
         def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
             """Update the cached states and the persistent batch with the scheduler
@@ -1225,9 +1223,9 @@ def _patch_gpu_model_runner() -> None:
             The SamplingMetadata is updated and copied to the GPU if there is a
             new/resumed/paused/finished request in the batch.
             """
+            self.ucm_sparse_update_states(scheduler_output)
             # Remove finished requests from the cached states.
             for req_id in scheduler_output.finished_req_ids:
-                self.ucm_sparse_request_finished_in_worker(req_id)
                 self.requests.pop(req_id, None)
                 self.encoder_cache.pop(req_id, None)
             # Remove the finished requests from the persistent batch.

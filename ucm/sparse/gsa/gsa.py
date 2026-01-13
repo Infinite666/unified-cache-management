@@ -1023,12 +1023,13 @@ class GSA(UcmSparseBase):
     def request_finished_in_scheduler(self, request_id: ReqType):
         pass
 
-    def request_finished_in_worker(self, request_id: ReqType):
-        if self.topk_kpre_manger.is_exist(request_id):
-            self.topk_kpre_manger.free(request_id)
-        if request_id in self.gsa_stats:
-            del self.gsa_stats[request_id]
-        self.prefetch_engine.del_finish_meta(request_id)
+    def update_states(self, scheduler_output: SchedulerOutput) -> None:
+        for request_id in scheduler_output.finished_req_ids:
+            if self.topk_kpre_manger.is_exist(request_id):
+                self.topk_kpre_manger.free(request_id)
+            if request_id in self.gsa_stats:
+                del self.gsa_stats[request_id]
+            self.prefetch_engine.del_finish_meta(request_id)
 
     def update_state_after_alloc(self, request: Request, num_blocks: int):
         pass

@@ -12,11 +12,11 @@ The class provides the following primitives:
             Returns metadata for the next step.
 
     Worker-side: runs in each worker, retrieval/load KV cache.
-        execute_begin() - hook at the beginning of "ModelRunner->execute_model".
-        execute_finished() - hook at the end of "ModelRunner->execute_model".
+        execute_begin() - hook at the beginning of "ModelRunner->execute_model->model".
+        execute_finished() - hook at the end of "ModelRunner->execute_model->model".
         attention_begin() - hook at the beginning of "unified_attention".
         attention_finished() - hook at the end of "unified_attention".
-        request_finished_in_worker() - release the resources, like block features.
+        update_states() - hook at the beginning of "ModelRunner->execute_model".
 """
 
 from __future__ import annotations
@@ -176,7 +176,7 @@ class UcmSparseBase(ABC):
 
     def execute_begin(self, scheduler_output: SchedulerOutput) -> None:
         """
-        This is called at the beginning of "ModelRunner->execute_model" function.
+        This is called at the beginning of "ModelRunner->execute_model->model" function.
         """
         pass
 
@@ -217,9 +217,10 @@ class UcmSparseBase(ABC):
         """
         pass
 
-    def request_finished_in_worker(self, request_id: Union[int, str]) -> None:
+    def update_states(self, scheduler_output: SchedulerOutput) -> None:
         """
-        This function releases the resources of finished requests at worker-side.
+        This is called at the beginning of "ModelRunner->execute_model" function.
+        Update the cached states with the scheduler output.
         """
         pass
 
