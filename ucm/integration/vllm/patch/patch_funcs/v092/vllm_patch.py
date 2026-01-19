@@ -1995,12 +1995,20 @@ def _patch_gpu_model_runner() -> None:
 def _patch_gpu_worker() -> None:
     """Patch gpu worker to add UCM sparse support."""
     try:
-        from typing import Optional
+        import gc
+        from typing import Optional, Tuple
+
+        import torch
 
         from vllm.config import VllmConfig
+        from vllm.utils import GiB_bytes, memory_profiling
+        from vllm.device_allocator.cumem import CuMemAllocator
         from vllm.v1.worker import gpu_worker
+        from vllm.v1.kv_cache_interface import KVCacheConfig
 
         from ucm.sparse.state import ensure_ucm_sparse_initialized
+        from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
+
 
         original_init_worker_distributed_environment = (
             gpu_worker.init_worker_distributed_environment
@@ -2021,5 +2029,91 @@ def _patch_gpu_worker() -> None:
         gpu_worker.init_worker_distributed_environment = (
             patched_init_worker_distributed_environment
         )
+
+        def ucm_sparse_get_sparse_cache_size() -> Tuple[int, int]:
+            if not has_ucm_sparse():
+                return
+            ucm_sparse = get_ucm_sparse()
+            return ucm_sparse.get_sparse_cache_size()
+
+        @torch.inference_mode()
+        def patched_determine_available_memory(self) -> int:
+            """Profiles the peak memory usage of the model to determine how much 
+            memory can be used for KV cache without OOMs.
+
+            The engine will first conduct a profiling of the existing memory usage.
+            Then, it calculate the free memory that can be used for KV cache in
+            bytes.
+
+            Tip:
+                You may limit the usage of GPU memory
+                by adjusting the `gpu_memory_utilization` parameter.
+            """
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            GiB = lambda b: b / GiB_bytes
+
+            # Execute a forward pass with dummy inputs to profile the memory usage
+            # of the model.
+            with memory_profiling(
+                    self.init_snapshot,
+                    weights_memory=int(
+                        self.model_runner.model_memory_usage)) as profile_result:
+                self.model_runner.profile_run()
+
+            free_gpu_memory = profile_result.after_profile.free_memory
+            # NOTE(woosuk): Here we assume that the other processes using the same
+            # GPU did not change their memory usage during the profiling.
+            assert self.init_snapshot.free_memory > free_gpu_memory, (
+                "Error in memory profiling. "
+                f"Initial free memory {GiB(self.init_snapshot.free_memory)} GiB, "
+                f"current free memory {GiB(free_gpu_memory)} GiB. "
+                "This happens when other processes sharing the same container "
+                "release GPU memory while vLLM is profiling during initialization. "
+                "To fix this, ensure consistent GPU memory allocation or "
+                "isolate vLLM in its own container.")
+            available_kv_cache_memory = self.requested_memory \
+                - profile_result.non_kv_cache_memory
+
+            fixed_sparse_cache_size, sparse_compression_ratio = ucm_sparse_get_sparse_cache_size()
+            if fixed_sparse_cache_size is not None:
+                available_kv_cache_memory -= fixed_sparse_cache_size
+            if sparse_compression_ratio is not None:
+                available_kv_cache_memory = int(available_kv_cache_memory * (1 - 1 / sparse_compression_ratio))
+
+            logger.debug(
+                "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
+                "requested GPU memory: %.2f GiB",
+                GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
+                GiB(self.requested_memory))
+            logger.debug(profile_result)
+            logger.info("Available KV cache memory: %.2f GiB, "
+                        "Fixed sparse cache memory: %.2f GiB, sparse compression ratio=%d",
+                        GiB(available_kv_cache_memory), GiB(fixed_sparse_cache_size), sparse_compression_ratio)
+            gc.collect()
+
+            return int(available_kv_cache_memory)
+
+        gpu_worker.Worker.determine_available_memory = patched_determine_available_memory
+
+        def ucm_sparse_initialize_sparse_cache(kv_cache_config: KVCacheConfig) -> None:
+            if not has_ucm_sparse():
+                return
+            ucm_sparse = get_ucm_sparse()
+            return ucm_sparse.initialize_sparse_cache(kv_cache_config)
+
+        def patched_initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+            """Allocate GPU KV cache with the specified kv_cache_config."""
+            if self.vllm_config.model_config.enable_sleep_mode:
+                allocator = CuMemAllocator.get_instance()
+                context = allocator.use_memory_pool(tag="kv_cache")
+            else:
+                from contextlib import nullcontext
+                context = nullcontext()
+            with context:
+                self.model_runner.initialize_kv_cache(kv_cache_config)
+            ucm_sparse_initialize_sparse_cache(kv_cache_config)
+
+        gpu_worker.Worker.initialize_from_config = patched_initialize_from_config
     except ImportError:
         logger.warning("Could not patch gpu worker - module not found")

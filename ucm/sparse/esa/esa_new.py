@@ -1,17 +1,13 @@
-# TODO: init ESA before warmup to make profile_run right!!!
-# TODO: reduce memory usage
-# TODO: interface of esa_retrieval
-
-import math
 from itertools import chain
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.cuda.nvtx as nvtx
 
 from vllm.config import VllmConfig
 from vllm.forward_context import ForwardContext
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
@@ -78,19 +74,18 @@ class ESA(UcmSparseBase):
         super().__init__(vllm_config, role)
 
         model_config = vllm_config.model_config
-        max_block_per_seq = math.ceil(model_config.max_model_len / vllm_config.cache_config.block_size)
         self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self.max_num_blocks =  max_block_per_seq * self.max_num_seqs
-        self.num_kv_heads =  model_config.get_num_kv_heads(vllm_config.parallel_config)
+        self.max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.block_size = vllm_config.cache_config.block_size
+        self.max_num_batched_blocks = cdiv(self.max_num_batched_tokens, self.block_size)
+        self.num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
+        self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.head_size = model_config.get_head_size()
         self.num_layers = model_config.hf_config.num_hidden_layers
-        self.block_size = vllm_config.cache_config.block_size
         self.device = vllm_config.device_config.device
         self.dtype = model_config.dtype
         self.pin_memory = True
-
         self._init_sparse_cfg()
-        self._init_cache()
 
     def _init_sparse_cfg(self):
         self.esa_cfg = Config(self.vllm_config.kv_transfer_config).get_config().get("ucm_sparse_config").get("ESA")
@@ -101,39 +96,47 @@ class ESA(UcmSparseBase):
         self.fixed_window = self.init_window + self.local_window
         assert self.min_blocks > self.fixed_window, "ESA min_blocks should be larger than init_window_sz + local_window_sz."
 
-    def _init_cache(self):
+    def get_sparse_cache_size(self) -> Tuple[int, int]:
+        fixed_cache_size = self.max_num_batched_blocks * self.dtype.itemsize
+        fixed_cache_size += self.max_num_batched_blocks * torch.int32.itemsize * 7
+        fixed_cache_size += self.fixed_window * self.max_num_seqs * torch.int32.itemsize
+        compression_ratio = self.block_size
+        return fixed_cache_size, compression_ratio
+
+    def initialize_sparse_cache(self, kv_cache_config: KVCacheConfig) -> None:
         if self.role != UcmSparseRole.WORKER:
             return
 
         # kv and repre cache
-        host_kv_shape = (1000, self.block_size, self.num_kv_heads, self.head_size) # TODO:从config里拿到实际的blocks数量*3
+        num_gpu_blocks = kv_cache_config.num_blocks
+        host_kv_shape = (num_gpu_blocks, self.block_size, self.num_kv_heads, self.head_size)
         self.host_kv_cache = [
             torch.zeros(host_kv_shape, dtype=self.dtype, device="cpu", pin_memory=self.pin_memory)
             for _ in range(self.num_layers)
         ]
-        repre_shape = (self.max_num_blocks, self.num_kv_heads, self.head_size)
+        repre_shape = (num_gpu_blocks, self.num_kv_heads, self.head_size)
         self.device_repre_cache = [
             torch.zeros(repre_shape, dtype=self.dtype, device=self.device)
             for _ in range(self.num_layers)
         ]
-        self.block_manager = UcmSparseBlockManager(self.max_num_blocks)
+        self.block_manager = UcmSparseBlockManager(num_gpu_blocks)
 
         # retrieval input and output
         self.retrieval_input = esa_lib.RetrievalInputTensor()
         self.retrieval_output = esa_lib.RetrievalOutputTensor()
-        self.retrieval_output.score = torch.zeros(self.max_num_blocks, dtype=self.dtype, device=self.device)
-        self.retrieval_output.score_cpu = torch.zeros(self.max_num_blocks, dtype=self.dtype, device="cpu", pin_memory=self.pin_memory)
-        self.retrieval_output.score_sorted_cpu = torch.zeros(self.max_num_blocks, dtype=self.dtype, device="cpu", pin_memory=self.pin_memory)
-        self.retrieval_output.index_sorted_cpu = torch.zeros(self.max_num_blocks, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
+        self.retrieval_output.score = torch.zeros(self.max_num_batched_blocks, dtype=self.dtype, device=self.device)
+        self.retrieval_output.score_cpu = torch.zeros(self.max_num_batched_blocks, dtype=self.dtype, device="cpu", pin_memory=self.pin_memory)
+        self.retrieval_output.score_sorted_cpu = torch.zeros(self.max_num_batched_blocks, dtype=self.dtype, device="cpu", pin_memory=self.pin_memory)
+        self.retrieval_output.index_sorted_cpu = torch.zeros(self.max_num_batched_blocks, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
 
         # batch dynamic metadata
-        self.prefill_kv_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
-        self.prefill_repre_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
-        self.decode_kv_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
-        self.decode_repre_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
-        self.decode_leftover_kv_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
-        self.decode_leftover_repre_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
-        self.decode_req_indexes = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
+        self.prefill_kv_blocks = self._make_buffer(self.max_num_batched_blocks, dtype=torch.int32)
+        self.prefill_repre_blocks = self._make_buffer(self.max_num_batched_blocks, dtype=torch.int32)
+        self.decode_kv_blocks = self._make_buffer(self.max_num_batched_blocks, dtype=torch.int32)
+        self.decode_repre_blocks = self._make_buffer(self.max_num_batched_blocks, dtype=torch.int32)
+        self.decode_leftover_kv_blocks = self._make_buffer(self.max_num_batched_blocks, dtype=torch.int32)
+        self.decode_leftover_repre_blocks = self._make_buffer(self.max_num_batched_blocks, dtype=torch.int32)
+        self.decode_req_indexes = self._make_buffer(self.max_num_batched_blocks, dtype=torch.int32)
         self.decode_fixed_indexes = self._make_buffer(self.fixed_window * self.max_num_seqs, dtype=torch.int32)
         self.decode_batch_offset = torch.zeros(self.max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
 
@@ -314,7 +317,7 @@ class ESA(UcmSparseBase):
     def _free_cached_request(self, request_id: Union[int, str]) -> None:
         if request_id not in self.cached_reqs:
             return
-        print(f"free req={request_id}")
+
         self.block_manager.free(self.cached_reqs[request_id].sparse_blocks)
         del self.cached_reqs[request_id]
 

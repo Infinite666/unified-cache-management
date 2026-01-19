@@ -23,12 +23,13 @@ from __future__ import annotations
 
 import enum
 from abc import ABC
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
     from vllm.v1.request import Request
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -173,6 +174,20 @@ class UcmSparseBase(ABC):
     # ==============================
     # Worker-side methods
     # ==============================
+
+    def initialize_sparse_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """
+        This is called at the "Worker->initialize_from_config" function.
+        Initializes the necessary caches for sparse.
+        """
+        pass
+
+    def get_sparse_cache_size(self) -> Tuple[int, int]:
+        """
+        This is called at the "Worker->determine_available_memory" function.
+        Returns the fixed_cache_size and compression_ratio (relative compression ratio of one block).
+        """
+        pass
 
     def execute_begin(self, scheduler_output: SchedulerOutput) -> None:
         """
